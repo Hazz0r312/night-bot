@@ -1,35 +1,62 @@
 const express  = require('express');
 const axios    = require('axios');
 const path     = require('path');
+const fs       = require('fs');
 const { Guild, User, PremiumOrder } = require('../database/models');
+
+// Rate limiter simple sin dependencias externas
+const rateLimitMap = new Map();
+function rateLimit(ip, max = 30, windowMs = 60000) {
+  const now  = Date.now();
+  const data = rateLimitMap.get(ip) || { count: 0, reset: now + windowMs };
+  if (now > data.reset) { data.count = 0; data.reset = now + windowMs; }
+  data.count++;
+  rateLimitMap.set(ip, data);
+  return data.count > max;
+}
 
 class WebServer {
   static start(client) {
     const app  = express();
     const PORT = process.env.PORT || 3000;
 
-    app.use(express.json());
+    app.use(express.json({ limit: '10kb' })); // Limitar payload
     app.use(express.static(path.join(__dirname, '../../dashboard/public')));
 
-    // ── Health check para Render ───────────────────────────────────────────────
+    // ── Headers de seguridad ───────────────────────────────────────────────────
+    app.use((req, res, next) => {
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('X-XSS-Protection', '1; mode=block');
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      next();
+    });
+
+    // ── Rate limiting global ───────────────────────────────────────────────────
+    app.use((req, res, next) => {
+      const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+      if (rateLimit(ip, 60, 60000)) {
+        return res.status(429).json({ error: 'Demasiadas peticiones. Espera un momento.' });
+      }
+      next();
+    });
+
+    // ── Health ────────────────────────────────────────────────────────────────
     app.get('/', (req, res) => res.json({
       status: 'online',
       bot:    client.user?.tag || 'iniciando...',
       guilds: client.guilds.cache.size,
     }));
-
     app.get('/health', (req, res) => res.json({ ok: true }));
 
-    // ── Obtener token de PayPal ────────────────────────────────────────────────
+    // ── PayPal token ──────────────────────────────────────────────────────────
     async function getPaypalToken() {
       const base = process.env.PAYPAL_MODE === 'live'
         ? 'https://api-m.paypal.com'
         : 'https://api-m.sandbox.paypal.com';
-
       const auth = Buffer.from(
         `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_CLIENT_SECRET}`
       ).toString('base64');
-
       const res = await axios.post(
         `${base}/v1/oauth2/token`,
         'grant_type=client_credentials',
@@ -38,22 +65,21 @@ class WebServer {
       return { token: res.data.access_token, base };
     }
 
-    // ── Checkout — redirige a PayPal ──────────────────────────────────────────
+    // ── Checkout ──────────────────────────────────────────────────────────────
     app.get('/premium/checkout', async (req, res) => {
       const { discordId, guildId, type } = req.query;
 
-      if (!discordId) {
-        return res.status(400).send(errorPage('Falta el Discord ID.'));
+      // Validar Discord ID
+      if (!discordId || !/^\d{17,20}$/.test(discordId)) {
+        return res.status(400).send(errorPage('Discord ID inválido.'));
       }
 
-      // Si no hay credenciales de PayPal configuradas
       if (!process.env.PAYPAL_CLIENT_ID || process.env.PAYPAL_CLIENT_ID === 'TU_PAYPAL_CLIENT_ID') {
         return res.send(noPaypalPage());
       }
 
       try {
         const { token, base } = await getPaypalToken();
-
         const order = await axios.post(`${base}/v2/checkout/orders`, {
           intent: 'CAPTURE',
           purchase_units: [{
@@ -66,63 +92,47 @@ class WebServer {
             brand_name:  'Night Bot',
             user_action: 'PAY_NOW',
           },
-        }, {
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
-        });
+        }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
 
-        // Guardar orden pendiente
         try {
           await PremiumOrder.create({
-            orderId:   order.data.id,
-            discordId,
-            guildId:   guildId || null,
-            type:      type || 'user',
-            amount:    1.00,
-            status:    'pending',
+            orderId: order.data.id, discordId,
+            guildId: guildId || null, type: type || 'user', amount: 1.00, status: 'pending',
           });
         } catch {}
 
-        // Redirigir al link de aprobación de PayPal
         const approveUrl = order.data.links.find(l => l.rel === 'approve')?.href;
-        if (!approveUrl) return res.status(500).send(errorPage('Error al crear la orden de PayPal.'));
-
+        if (!approveUrl) return res.status(500).send(errorPage('Error al crear la orden.'));
         res.redirect(approveUrl);
       } catch (err) {
         console.error('PayPal checkout error:', err.message);
-        res.status(500).send(errorPage(`Error de PayPal: ${err.message}`));
+        res.status(500).send(errorPage('Error de PayPal. Contacta con soporte.'));
       }
     });
 
-    // ── Success — PayPal redirige aquí tras el pago ────────────────────────────
+    // ── Success ───────────────────────────────────────────────────────────────
     app.get('/premium/success', async (req, res) => {
       const { token, discordId, guildId, type } = req.query;
-      if (!token) return res.redirect('/premium/cancel');
+      if (!token || !discordId) return res.redirect('/premium/cancel');
 
       try {
         const { token: accessToken, base } = await getPaypalToken();
-
-        // Capturar el pago
         const capture = await axios.post(
-          `${base}/v2/checkout/orders/${token}/capture`,
-          {},
+          `${base}/v2/checkout/orders/${token}/capture`, {},
           { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
         );
+        if (capture.data.status !== 'COMPLETED') return res.redirect('/premium/cancel');
 
-        if (capture.data.status !== 'COMPLETED') {
-          return res.redirect('/premium/cancel');
-        }
-
-        // Activar premium — 30 días
         const expires = new Date();
         expires.setDate(expires.getDate() + 30);
 
-        if (type === 'server' && guildId) {
+        if (type === 'server' && guildId && /^\d{17,20}$/.test(guildId)) {
           await Guild.findOneAndUpdate(
             { guildId },
             { premium: true, premiumExpires: expires, premiumOrderId: token },
             { upsert: true }
           );
-        } else {
+        } else if (/^\d{17,20}$/.test(discordId)) {
           await User.findOneAndUpdate(
             { userId: discordId, guildId: guildId || 'global' },
             { premium: true, premiumExpires: expires, premiumOrderId: token },
@@ -132,7 +142,7 @@ class WebServer {
 
         await PremiumOrder.updateOne({ orderId: token }, { status: 'completed' }).catch(() => {});
 
-        // Notificar por DM en Discord
+        // DM al usuario
         try {
           const user = await client.users.fetch(discordId);
           const { EmbedBuilder } = require('discord.js');
@@ -140,12 +150,11 @@ class WebServer {
             .setColor(0xF0C040)
             .setTitle('⭐ ¡Premium activado!')
             .setDescription(
-              `Tu premium de Night Bot ha sido activado correctamente.\n\n` +
+              `Tu premium ha sido activado correctamente.\n\n` +
               `**Tipo:** ${type === 'server' ? '🖥️ Servidor' : '👤 Usuario'}\n` +
               `**Válido hasta:** <t:${Math.floor(expires.getTime() / 1000)}:D>\n\n` +
               `¡Gracias por apoyar Night Bot! 🌙`
-            )
-            .setTimestamp()
+            ).setTimestamp()
           ]});
         } catch {}
 
@@ -156,65 +165,53 @@ class WebServer {
       }
     });
 
-    // ── Cancel ────────────────────────────────────────────────────────────────
     app.get('/premium/cancel', (req, res) => res.send(cancelPage()));
 
     // ── Dashboard ─────────────────────────────────────────────────────────────
     app.get('*', (req, res) => {
       const indexPath = path.join(__dirname, '../../dashboard/public/index.html');
-      if (require('fs').existsSync(indexPath)) {
+      if (fs.existsSync(indexPath)) {
         res.sendFile(indexPath);
       } else {
         res.json({ status: 'Night Bot API', version: '2.0.0' });
       }
     });
 
-    app.listen(PORT, () => {
-      console.log(`✅ Servidor web en puerto ${PORT}`);
-    });
+    app.listen(PORT, () => console.log(`✅ Servidor web en puerto ${PORT}`));
   }
 }
 
-// ── Páginas HTML ──────────────────────────────────────────────────────────────
 function successPage() {
-  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>¡Premium activado! — Night Bot</title>
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Premium activado — Night Bot</title>
   <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#06060f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh}
   .card{text-align:center;padding:48px 40px;border:1px solid rgba(240,192,64,.3);border-radius:20px;max-width:440px;background:#111125}
-  h1{color:#f0c040;font-size:28px;margin:16px 0 12px}.sub{color:#9896b8;font-size:15px;line-height:1.7}
-  .note{font-size:12px;color:#6b6890;margin-top:24px}</style></head>
+  h1{color:#f0c040;font-size:26px;margin:16px 0 10px}.sub{color:#9896b8;font-size:14px;line-height:1.7}.note{font-size:12px;color:#6b6890;margin-top:20px}</style></head>
   <body><div class="card"><div style="font-size:52px">⭐</div><h1>¡Premium activado!</h1>
   <p class="sub">Tu pago fue procesado correctamente.<br>Revisa tus mensajes directos en Discord.</p>
   <p class="note">Puedes cerrar esta ventana</p></div></body></html>`;
 }
-
 function cancelPage() {
-  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Pago cancelado — Night Bot</title>
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Cancelado — Night Bot</title>
   <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#06060f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh}
-  .card{text-align:center;padding:48px 40px;border:1px solid rgba(255,255,255,.1);border-radius:20px;max-width:440px;background:#111125}
-  h1{color:#9896b8;font-size:24px;margin:16px 0 12px}.sub{color:#6b6890;font-size:14px}</style></head>
-  <body><div class="card"><div style="font-size:48px">❌</div><h1>Pago cancelado</h1>
-  <p class="sub">No se realizó ningún cargo. Puedes cerrar esta ventana.</p></div></body></html>`;
+  .card{text-align:center;padding:48px 40px;border:1px solid rgba(255,255,255,.08);border-radius:20px;max-width:440px;background:#111125}
+  h1{color:#9896b8;font-size:22px;margin:16px 0 10px}.sub{color:#6b6890;font-size:14px}</style></head>
+  <body><div class="card"><div style="font-size:48px">✖</div><h1>Pago cancelado</h1>
+  <p class="sub">No se realizó ningún cargo.</p></div></body></html>`;
 }
-
 function errorPage(msg) {
   return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error — Night Bot</title>
   <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#06060f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh}
   .card{text-align:center;padding:48px 40px;border:1px solid rgba(242,92,110,.3);border-radius:20px;max-width:440px;background:#111125}
-  h1{color:#f25c6e;font-size:24px;margin:16px 0 12px}.sub{color:#9896b8;font-size:14px}</style></head>
-  <body><div class="card"><div style="font-size:48px">⚠️</div><h1>Error</h1>
-  <p class="sub">${msg}</p></div></body></html>`;
+  h1{color:#f25c6e;font-size:22px;margin:16px 0 10px}.sub{color:#9896b8;font-size:14px}</style></head>
+  <body><div class="card"><div style="font-size:48px">⚠</div><h1>Error</h1><p class="sub">${msg}</p></div></body></html>`;
 }
-
 function noPaypalPage() {
-  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>PayPal no configurado — Night Bot</title>
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Sin configurar — Night Bot</title>
   <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#06060f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh}
   .card{text-align:center;padding:48px 40px;border:1px solid rgba(240,192,64,.3);border-radius:20px;max-width:480px;background:#111125}
-  h1{color:#f0c040;font-size:22px;margin:16px 0 12px}.sub{color:#9896b8;font-size:14px;line-height:1.7}
-  code{background:#1c1c38;padding:3px 8px;border-radius:5px;font-size:13px;color:#a399fb}</style></head>
-  <body><div class="card"><div style="font-size:48px">⚙️</div><h1>PayPal no configurado</h1>
-  <p class="sub">El administrador del bot necesita configurar las credenciales de PayPal.<br><br>
-  Añade <code>PAYPAL_CLIENT_ID</code> y <code>PAYPAL_CLIENT_SECRET</code> en las variables de entorno de Render.</p>
-  </div></body></html>`;
+  h1{color:#f0c040;font-size:20px;margin:16px 0 10px}.sub{color:#9896b8;font-size:14px;line-height:1.7}</style></head>
+  <body><div class="card"><div style="font-size:48px">⚙</div><h1>PayPal no configurado</h1>
+  <p class="sub">El administrador necesita configurar las credenciales de PayPal en Render.</p></div></body></html>`;
 }
 
 module.exports = WebServer;

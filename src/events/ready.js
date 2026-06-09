@@ -9,9 +9,8 @@ module.exports = {
     console.log(`👥 Usuarios: ${client.users.cache.size}\n`);
 
     const acts = [
-      { name: '/help | nightbot.app',       type: ActivityType.Playing },
-      { name: `${client.guilds.cache.size} servidores 🌙`, type: ActivityType.Watching },
-      { name: 'comunidades crecer ⭐',       type: ActivityType.Watching },
+      { name: '/help | nightbot-web.netlify.app',       type: ActivityType.Playing },
+      { name: `${client.guilds.cache.size} servidores <:Night_Bot:1512903254730866858>`, type: ActivityType.Watching },
       { name: 'Premium por $1/mes 💎',       type: ActivityType.Playing },
     ];
     let i = 0;
