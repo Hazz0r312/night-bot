@@ -1,25 +1,34 @@
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+/**
+ * NIGHT BOT — AISystem.js
+ * Powered by Groq (gratis, muy rápido) — Llama 3.3 70B
+ * 
+ * Obtén tu key gratis en: console.groq.com/keys
+ */
+const axios = require('axios');
 const { EmbedBuilder } = require('discord.js');
 
+const GROQ_URL   = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL = 'llama-3.3-70b-versatile'; // Modelo gratuito de Groq, muy potente
+
+// Historial de conversación por canal (en memoria)
 const chatHistory = new Map();
 
 class AISystem {
-  static _getModel() {
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    // gemini-1.5-flash fue reemplazado — usar gemini-2.0-flash que es gratuito y estable
-    return genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+  static _checkKey() {
+    if (!process.env.GROQ_API_KEY || process.env.GROQ_API_KEY === 'tu_groq_key_aqui') {
+      throw new Error('GROQ_API_KEY no configurada en .env');
+    }
   }
 
-  // Respuesta en canal de chat IA (con historial)
+  // ─── Respuesta en canal de chat IA (con historial) ────────────────────────
   static async respond(message, config) {
-    if (!process.env.GEMINI_API_KEY) return;
+    this._checkKey();
 
     const typingInterval = setInterval(() => message.channel.sendTyping().catch(() => {}), 5000);
     message.channel.sendTyping().catch(() => {});
 
     try {
-      const model = AISystem._getModel();
-
       const personality = config?.aiPersonality ||
         'Eres Night, un bot de Discord amigable, divertido y útil. Responde siempre en el idioma del usuario. Sé conciso.';
 
@@ -27,47 +36,83 @@ class AISystem {
       if (!chatHistory.has(key)) chatHistory.set(key, []);
       const history = chatHistory.get(key);
 
+      // Limitar historial a 10 intercambios (20 mensajes)
       if (history.length > 20) history.splice(0, history.length - 20);
 
-      const chat = model.startChat({
-        history,
-        generationConfig: { maxOutputTokens: 500, temperature: 0.8 },
-        systemInstruction: `${personality}\n\nServidor: "${message.guild.name}". Usuario: "${message.author.username}".`,
+      const messages = [
+        {
+          role: 'system',
+          content: `${personality}\n\nServidor: "${message.guild.name}". Usuario: "${message.author.username}".`,
+        },
+        ...history,
+        { role: 'user', content: message.content },
+      ];
+
+      const response = await axios.post(GROQ_URL, {
+        model: GROQ_MODEL,
+        messages,
+        max_tokens: 600,
+        temperature: 0.85,
+      }, {
+        headers: {
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
       });
 
-      const result   = await chat.sendMessage(message.content);
-      const response = result.response.text();
+      const answer = response.data.choices[0].message.content;
 
-      history.push({ role: 'user',  parts: [{ text: message.content }] });
-      history.push({ role: 'model', parts: [{ text: response }] });
+      // Guardar en historial
+      history.push({ role: 'user', content: message.content });
+      history.push({ role: 'assistant', content: answer });
 
       clearInterval(typingInterval);
 
-      if (response.length > 1900) {
+      if (answer.length > 1900) {
         await message.reply({ embeds: [new EmbedBuilder()
           .setColor(0x5865F2)
           .setAuthor({ name: '🤖 Night IA', iconURL: message.client.user.displayAvatarURL() })
-          .setDescription(response.substring(0, 4000))
-          .setFooter({ text: 'Powered by Google Gemini' })]
+          .setDescription(answer.substring(0, 4000))
+          .setFooter({ text: 'Powered by Groq · Llama 3.3' })]
         });
       } else {
-        await message.reply(response);
+        await message.reply(answer);
       }
     } catch (err) {
       clearInterval(typingInterval);
-      console.error('Gemini error:', err.message);
+      console.error('Groq error:', err.response?.data || err.message);
+
+      if (err.response?.status === 429) {
+        message.reply('⚠️ Límite de IA alcanzado temporalmente. Intenta de nuevo en unos segundos.').catch(() => {});
+      }
     }
   }
 
-  // Pregunta directa sin historial (/ia ask)
-  static async ask(question, guildName = '') {
-    if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY no configurada en .env');
+  // ─── Pregunta directa sin historial (/ia ask) ─────────────────────────────
+  static async ask(question, guildName = '', personality = null) {
+    this._checkKey();
 
-    const model  = AISystem._getModel();
-    const result = await model.generateContent(
-      `[Servidor Discord: ${guildName}]\nUsuario pregunta: ${question}`
-    );
-    return result.response.text();
+    const systemPrompt = personality ||
+      'Eres Night, un bot de Discord útil y amigable. Responde en el idioma del usuario. Sé conciso pero completo.';
+
+    const response = await axios.post(GROQ_URL, {
+      model: GROQ_MODEL,
+      messages: [
+        { role: 'system', content: `${systemPrompt}\n\nServidor Discord: ${guildName}` },
+        { role: 'user', content: question },
+      ],
+      max_tokens: 700,
+      temperature: 0.8,
+    }, {
+      headers: {
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 15000,
+    });
+
+    return response.data.choices[0].message.content;
   }
 }
 

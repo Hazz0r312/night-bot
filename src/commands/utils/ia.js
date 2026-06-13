@@ -7,9 +7,11 @@ module.exports = {
   data: new SlashCommandBuilder()
     .setName('ia')
     .setDescription('🤖 Pregúntale algo a la IA de Night')
-    .addSubcommand(s => s.setName('ask').setDescription('Hacer una pregunta a la IA')
-      .addStringOption(o => o.setName('pregunta').setDescription('Tu pregunta').setRequired(true)))
-    .addSubcommand(s => s.setName('config').setDescription('Admin: Configurar canal de chat IA')
+    .addSubcommand(s => s.setName('ask')
+      .setDescription('Hacer una pregunta a la IA')
+      .addStringOption(o => o.setName('pregunta').setDescription('Tu pregunta').setRequired(true).setMaxLength(500)))
+    .addSubcommand(s => s.setName('config')
+      .setDescription('Admin: Configurar canal de chat IA')
       .addChannelOption(o => o.setName('canal').setDescription('Canal de chat IA (vacío = desactivar)').setRequired(false))),
 
   async execute(interaction, client, config) {
@@ -17,9 +19,7 @@ module.exports = {
 
     // ── ASK ───────────────────────────────────────────────────────────────────
     if (sub === 'ask') {
-
-      // Comprobar premium — el usuario tiene premium O el servidor tiene IA activada
-      const premium = await hasPremium(interaction.user.id, interaction.guildId);
+      const premium     = await hasPremium(interaction.user.id, interaction.guildId);
       const aiActivated = config?.aiEnabled === true;
 
       if (!premium && !aiActivated) {
@@ -28,9 +28,8 @@ module.exports = {
             .setColor(COLORS.gold)
             .setTitle('⭐ Función Premium')
             .setDescription(
-              'El comando `/ia ask` requiere **Night Premium** o que un administrador active la IA en el servidor.\n\n' +
-              '**¿Cómo activarlo?**\n' +
-              '• `/premium buy` — Compra premium por $1/mes\n' +
+              'El comando `/ia ask` requiere **Night Premium** o que un admin active la IA.\n\n' +
+              '• `/premium buy` — Comprar premium por $1/mes\n' +
               '• `/ia config #canal` — Admin activa IA para todos'
             )
           ],
@@ -39,27 +38,72 @@ module.exports = {
       }
 
       const question = interaction.options.getString('pregunta');
+
+      // CRÍTICO: deferReply antes de cualquier operación async
       await interaction.deferReply();
 
-      try {
-        const answer = await AISystem.ask(question, interaction.guild.name);
-        const embed  = new EmbedBuilder()
-          .setColor(COLORS.main)
-          .setAuthor({ name: '🤖 Night IA', iconURL: interaction.client.user.displayAvatarURL() })
-          .setDescription(answer.substring(0, 4000))
-          .setFooter({ text: 'Powered by Google Gemini • /ia ask' })
-          .setTimestamp();
+      if (!process.env.GROQ_API_KEY || process.env.GROQ_API_KEY === 'tu_groq_key_aqui') {
+        return interaction.editReply({ embeds: [new EmbedBuilder()
+          .setColor(COLORS.error)
+          .setTitle('❌ IA no configurada')
+          .setDescription(
+            'La API key de Groq no está configurada.\n\n' +
+            '**Pasos:**\n' +
+            '1. Ve a **console.groq.com/keys**\n' +
+            '2. Crea una cuenta gratis y genera una key\n' +
+            '3. Añádela en Render como `GROQ_API_KEY`\n' +
+            '4. Reinicia el bot'
+          )] });
+      }
 
-        await interaction.editReply({ embeds: [embed] });
+      try {
+        const answer = await AISystem.ask(question, interaction.guild.name, config?.aiPersonality);
+
+        await interaction.editReply({
+          embeds: [new EmbedBuilder()
+            .setColor(COLORS.main)
+            .setAuthor({ name: '🤖 Night IA', iconURL: interaction.client.user.displayAvatarURL() })
+            .setDescription(answer.substring(0, 4000))
+            .setFooter({ text: 'Powered by Groq · Llama 3.3 70B' })
+            .setTimestamp()
+          ],
+        });
+
       } catch (err) {
-        await interaction.editReply({ embeds: [errorEmbed(`Error de IA: ${err.message}`)] });
+        console.error('IA error:', err.response?.data || err.message);
+
+        if (err.response?.status === 429) {
+          return interaction.editReply({
+            embeds: [new EmbedBuilder()
+              .setColor(COLORS.warn)
+              .setTitle('⚠️ Límite alcanzado')
+              .setDescription('Demasiadas peticiones a la IA. Espera unos segundos e inténtalo de nuevo.')
+            ],
+          });
+        }
+
+        if (err.response?.status === 401) {
+          return interaction.editReply({
+            embeds: [new EmbedBuilder()
+              .setColor(COLORS.error)
+              .setTitle('❌ API Key inválida')
+              .setDescription('La key de Groq no es válida. Verifica `GROQ_API_KEY` en Render.')
+            ],
+          });
+        }
+
+        return interaction.editReply({ embeds: [errorEmbed(`Error de IA: ${(err.message || 'Desconocido').substring(0, 200)}`)] });
       }
     }
 
-    // ── CONFIG ────────────────────────────────────────────────────────────────
+    // ── CONFIG (admin) ────────────────────────────────────────────────────────
     else if (sub === 'config') {
-      if (!interaction.member.permissions.has(8n))
-        return interaction.reply({ embeds: [errorEmbed('Solo administradores pueden configurar la IA.')], flags: MessageFlags.Ephemeral });
+      if (!interaction.member.permissions.has(8n)) {
+        return interaction.reply({
+          embeds: [errorEmbed('Solo administradores pueden configurar la IA.')],
+          flags: MessageFlags.Ephemeral,
+        });
+      }
 
       const canal = interaction.options.getChannel('canal');
       const { Guild } = require('../../database/models');
@@ -70,10 +114,12 @@ module.exports = {
           { aiEnabled: true, aiChannel: canal.id },
           { upsert: true }
         );
-        interaction.reply({ embeds: [new EmbedBuilder()
-          .setColor(COLORS.success)
-          .setTitle('🤖 IA Activada')
-          .setDescription(`Canal de IA configurado: ${canal}\n\nTodos los usuarios podrán chatear con Night IA en ese canal sin necesidad de premium.`)]
+        return interaction.reply({
+          embeds: [new EmbedBuilder()
+            .setColor(COLORS.success)
+            .setTitle('🤖 IA Activada')
+            .setDescription(`Canal configurado: ${canal}\n\nTodos los usuarios podrán chatear con Night IA sin necesidad de premium.\n\n**Powered by Groq · Llama 3.3**`)
+          ],
         });
       } else {
         await Guild.findOneAndUpdate(
@@ -81,7 +127,9 @@ module.exports = {
           { aiEnabled: false, aiChannel: null },
           { upsert: true }
         );
-        interaction.reply({ embeds: [new EmbedBuilder().setColor(COLORS.error).setDescription('❌ IA desactivada en este servidor.')] });
+        return interaction.reply({
+          embeds: [new EmbedBuilder().setColor(COLORS.error).setDescription('❌ IA desactivada.')],
+        });
       }
     }
   },
