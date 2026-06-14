@@ -94,6 +94,60 @@ module.exports = {
       }
     }
 
+    // ─── Mención al bot (Premium) ─────────────────────────────────────────────
+    // Si tagean a Night directamente, responde con IA solo si tiene premium
+    if (message.mentions.has(client.user.id) && !message.mentions.everyone) {
+      const premium = await hasPremium(message.author.id, message.guild.id);
+
+      // Limpiar la mención del contenido
+      const content = message.content
+        .replace(/<@!?\d+>/g, '')
+        .trim();
+
+      if (content.length > 1) {
+        if (!premium) {
+          message.reply({
+            embeds: [new EmbedBuilder()
+              .setColor(0xF0C040)
+              .setTitle('⭐ Función Premium')
+              .setDescription(
+                '¡Hola! 👋 Para que pueda responderte cuando me mencionas necesitas **Night Premium**.\n\n' +
+                '• `/premium buy` — Activa premium por $1/mes\n' +
+                '• `/ia ask` — También puedes preguntarme con este comando (requiere premium o canal de IA)'
+              )
+            ]
+          }).catch(() => {});
+          return;
+        }
+
+        // Tiene premium → responder con IA
+        if (!process.env.GROQ_API_KEY || process.env.GROQ_API_KEY === 'tu_groq_key_aqui') return;
+
+        try {
+          message.channel.sendTyping().catch(() => {});
+          const AISystem = require('../systems/AISystem');
+          const answer = await AISystem.ask(content, message.guild.name, config?.aiPersonality);
+
+          if (answer.length > 1900) {
+            await message.reply({ embeds: [new EmbedBuilder()
+              .setColor(0x5865F2)
+              .setAuthor({ name: '🤖 Night IA', iconURL: client.user.displayAvatarURL() })
+              .setDescription(answer.substring(0, 4000))
+              .setFooter({ text: 'Powered by Groq · Llama 3.3' })]
+            });
+          } else {
+            await message.reply(answer);
+          }
+        } catch (err) {
+          console.error('AI mention error:', err.response?.data || err.message);
+          if (err.response?.status === 429) {
+            message.reply('⚠️ Límite de IA alcanzado, intenta en unos segundos.').catch(() => {});
+          }
+        }
+        return;
+      }
+    }
+
     // ─── Sistema XP ────────────────────────────────────────────────────────────
     if (!config?.levelsEnabled) return;
 

@@ -49,6 +49,14 @@ class WebServer {
     }));
     app.get('/health', (req, res) => res.json({ ok: true }));
 
+    // ── RUTA MOVIDA AQUÍ: Login de Discord (OAuth2) ───────────────────────────
+    app.get('/api/auth/login', (req, res) => {
+      const CLIENT_ID = process.env.DISCORD_CLIENT_ID || '1510720628020220015';
+      const REDIRECT_URI = 'https://night-bot-j5at.onrender.com/api/auth/callback';
+      const discordUrl = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify%20guilds`;
+      res.redirect(discordUrl);
+    });
+
     // ── PayPal token ──────────────────────────────────────────────────────────
     async function getPaypalToken() {
       const base = process.env.PAYPAL_MODE === 'live'
@@ -74,7 +82,7 @@ class WebServer {
         return res.status(400).send(errorPage('Discord ID inválido.'));
       }
 
-      if (!process.env.PAYPAL_CLIENT_ID || process.env.PAYPAL_CLIENT_ID === 'TU_PAYPAL_CLIENT_ID') {
+      if (!process.env.PAYPAL_CLIENT_ID || process.env.PAYPAL_CLIENT_ID === 'AZj6VpCazr5cpdt90jHgzMi4xLhdm4xga39InPNcreraSmBdr0yTXkoex28zdM0VkNiP-ew40HXb9FTz') {
         return res.send(noPaypalPage());
       }
 
