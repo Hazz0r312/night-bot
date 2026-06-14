@@ -57,17 +57,21 @@ class WebServer {
       res.redirect(discordUrl);
     });
 
-    // ── RUTA AGREGADA: Callback de Discord (OAuth2) ───────────────────────────
+    // ── NUEVA RUTA INTEGRADA: Callback de Discord (OAuth2) ────────────────────
     app.get('/api/auth/callback', async (req, res) => {
       const { code } = req.query;
       if (!code) return res.status(400).send(errorPage('No se proporcionó el código de autorización.'));
 
       try {
         const CLIENT_ID = process.env.DISCORD_CLIENT_ID || '1510720628020220015';
-        const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || 'TU_CLIENT_SECRET_AQUÍ';
+        const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET; 
         const REDIRECT_URI = 'https://night-bot-j5at.onrender.com/api/auth/callback';
 
-        // 1. Intercambiar el código que viste en tu imagen por el Token de acceso oficial
+        if (!CLIENT_SECRET) {
+          return res.status(500).send(errorPage('Falta configurar la variable de entorno DISCORD_CLIENT_SECRET en Render.'));
+        }
+
+        // Intercambiar código por Token de acceso
         const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', 
           new URLSearchParams({
             client_id: CLIENT_ID,
@@ -81,18 +85,18 @@ class WebServer {
 
         const { access_token } = tokenResponse.data;
 
-        // 2. Obtener los datos del usuario que acaba de autorizar (ID, avatar, etc.)
+        // Obtener datos del usuario
         const userResponse = await axios.get('https://discord.com/api/v10/users/@me', {
           headers: { Authorization: `Bearer ${access_token}` }
         });
 
-        // 3. Redirigir de golpe a tu frontend de Netlify pasándole el token y su ID por la URL
+        // Redirigir al frontend de Netlify pasándole los datos de sesión por URL
         const dashboardUrl = process.env.DASHBOARD_URL || 'https://dashboard-night-bot.netlify.app';
         res.redirect(`${dashboardUrl}?token=${access_token}&discordId=${userResponse.data.id}`);
 
       } catch (err) {
         console.error('Error en el callback de Discord:', err.response?.data || err.message);
-        res.status(500).send(errorPage('Error al conectar con Discord. Asegúrate de configurar el DISCORD_CLIENT_SECRET en Render.'));
+        res.status(500).send(errorPage('Error al procesar el login con Discord. Revisa las credenciales de tu bot.'));
       }
     });
 
