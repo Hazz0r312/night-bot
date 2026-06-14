@@ -49,12 +49,55 @@ class WebServer {
     }));
     app.get('/health', (req, res) => res.json({ ok: true }));
 
-    // ── RUTA MOVIDA AQUÍ: Login de Discord (OAuth2) ───────────────────────────
+    // ── Login de Discord (OAuth2) ─────────────────────────────────────────────
     app.get('/api/auth/login', (req, res) => {
       const CLIENT_ID = process.env.DISCORD_CLIENT_ID || '1510720628020220015';
       const REDIRECT_URI = 'https://night-bot-j5at.onrender.com/api/auth/callback';
       const discordUrl = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify%20guilds`;
       res.redirect(discordUrl);
+    });
+
+    // ── NUEVA RUTA INTEGRADA: Callback de Discord (OAuth2) ────────────────────
+    app.get('/api/auth/callback', async (req, res) => {
+      const { code } = req.query;
+      if (!code) return res.status(400).send(errorPage('No se proporcionó el código de autorización.'));
+
+      try {
+        const CLIENT_ID = process.env.DISCORD_CLIENT_ID || '1510720628020220015';
+        const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET; 
+        const REDIRECT_URI = 'https://night-bot-j5at.onrender.com/api/auth/callback';
+
+        if (!CLIENT_SECRET) {
+          return res.status(500).send(errorPage('Falta configurar la variable de entorno DISCORD_CLIENT_SECRET en Render.'));
+        }
+
+        // Intercambiar código por Token de acceso
+        const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', 
+          new URLSearchParams({
+            client_id: CLIENT_ID,
+            client_secret: CLIENT_SECRET,
+            grant_type: 'authorization_code',
+            code: code,
+            redirect_uri: REDIRECT_URI,
+          }), 
+          { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+        );
+
+        const { access_token } = tokenResponse.data;
+
+        // Obtener datos del usuario
+        const userResponse = await axios.get('https://discord.com/api/v10/users/@me', {
+          headers: { Authorization: `Bearer ${access_token}` }
+        });
+
+        // Redirigir al frontend de Netlify pasándole los datos de sesión por URL
+        const dashboardUrl = process.env.DASHBOARD_URL || 'https://dashboard-night-bot.netlify.app';
+        res.redirect(`${dashboardUrl}?token=${access_token}&discordId=${userResponse.data.id}`);
+
+      } catch (err) {
+        console.error('Error en el callback de Discord:', err.response?.data || err.message);
+        res.status(500).send(errorPage('Error al procesar el login con Discord. Revisa las credenciales de tu bot.'));
+      }
     });
 
     // ── PayPal token ──────────────────────────────────────────────────────────
@@ -160,66 +203,4 @@ class WebServer {
             .setDescription(
               `Tu premium ha sido activado correctamente.\n\n` +
               `**Tipo:** ${type === 'server' ? '🖥️ Servidor' : '👤 Usuario'}\n` +
-              `**Válido hasta:** <t:${Math.floor(expires.getTime() / 1000)}:D>\n\n` +
-              `¡Gracias por apoyar Night Bot! 🌙`
-            ).setTimestamp()
-          ]});
-        } catch {}
-
-        res.send(successPage());
-      } catch (err) {
-        console.error('PayPal capture error:', err.message);
-        res.redirect('/premium/cancel');
-      }
-    });
-
-    app.get('/premium/cancel', (req, res) => res.send(cancelPage()));
-
-    // ── Dashboard ─────────────────────────────────────────────────────────────
-    app.get('*', (req, res) => {
-      const indexPath = path.join(__dirname, '../../dashboard/public/index.html');
-      if (fs.existsSync(indexPath)) {
-        res.sendFile(indexPath);
-      } else {
-        res.json({ status: 'Night Bot API', version: '2.0.0' });
-      }
-    });
-
-    app.listen(PORT, () => console.log(`✅ Servidor web en puerto ${PORT}`));
-  }
-}
-
-function successPage() {
-  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Premium activado — Night Bot</title>
-  <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#06060f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh}
-  .card{text-align:center;padding:48px 40px;border:1px solid rgba(240,192,64,.3);border-radius:20px;max-width:440px;background:#111125}
-  h1{color:#f0c040;font-size:26px;margin:16px 0 10px}.sub{color:#9896b8;font-size:14px;line-height:1.7}.note{font-size:12px;color:#6b6890;margin-top:20px}</style></head>
-  <body><div class="card"><div style="font-size:52px">⭐</div><h1>¡Premium activado!</h1>
-  <p class="sub">Tu pago fue procesado correctamente.<br>Revisa tus mensajes directos en Discord.</p>
-  <p class="note">Puedes cerrar esta ventana</p></div></body></html>`;
-}
-function cancelPage() {
-  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Cancelado — Night Bot</title>
-  <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#06060f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh}
-  .card{text-align:center;padding:48px 40px;border:1px solid rgba(255,255,255,.08);border-radius:20px;max-width:440px;background:#111125}
-  h1{color:#9896b8;font-size:22px;margin:16px 0 10px}.sub{color:#6b6890;font-size:14px}</style></head>
-  <body><div class="card"><div style="font-size:48px">✖</div><h1>Pago cancelado</h1>
-  <p class="sub">No se realizó ningún cargo.</p></div></body></html>`;
-}
-function errorPage(msg) {
-  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error — Night Bot</title>
-  <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#06060f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh}
-  .card{text-align:center;padding:48px 40px;border:1px solid rgba(242,92,110,.3);border-radius:20px;max-width:440px;background:#111125}
-  h1{color:#f25c6e;font-size:22px;margin:16px 0 10px}.sub{color:#9896b8;font-size:14px}</style></head>
-  <body><div class="card"><div style="font-size:48px">⚠</div><h1>Error</h1><p class="sub">${msg}</p></div></body></html>`;
-}
-function noPaypalPage() {
-  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Sin configurar — Night Bot</title>
-  <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#06060f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh}
-  .card{text-align:center;padding:48px 40px;border:1px solid rgba(240,192,64,.3);border-radius:20px;max-width:480px;background:#111125}
-  h1{color:#f0c040;font-size:20px;margin:16px 0 10px}.sub{color:#9896b8;font-size:14px;line-height:1.7}</style></head>
-  <body><div class="card"><div style="font-size:48px">⚙</div><h1>PayPal no configurado</h1>
-  <p class="sub">El administrador necesita configurar las credenciales de PayPal en Render.</p></div></body></html>`;
-}
-
-module.exports = WebServer;
+              `**Válido hasta:** <t:${Math.floor(expires.getTime() / 1000)}:D>\
